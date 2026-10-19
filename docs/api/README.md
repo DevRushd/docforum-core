@@ -134,8 +134,53 @@ drift apart. See `docs/adr/0003` for why production needs `SameSite=None`.
 
 | Method & path | Auth | Notes |
 |---|---|---|
-| `GET /doctors/me` | doctor | Returns the caller's own `DoctorProfile`. |
-| `PATCH /doctors/:doctorProfileId/verification` | admin | Body `{ status: 'pending'\|'verified'\|'rejected' }`. Manual, admin-gated per PRD FR-3 — there is no automated verification pipeline. |
+| `GET /doctors/me` | doctor | Returns the caller's own `DoctorProfile`. Carries `ETag: "<version>"` and `version` in the body — see below. |
+| `PATCH /doctors/me` | doctor | Body `{ fullName }`. **Requires `If-Match`** with the `ETag` from the read (below). `428` without it, `412` if stale. |
+| `PATCH /doctors/:doctorProfileId/verification` | admin | Body `{ status: 'pending'\|'verified'\|'rejected' }`. Manual, admin-gated per PRD FR-3 — there is no automated verification pipeline. This is an already-conditional status transition, so it takes **no** `If-Match`; it bumps `version` and returns it. |
+
+### Optimistic concurrency (Phase 8, issue #49)
+
+Mutable records (`User`, the three profiles, `FacilityCapability`,
+`Appointment`, `PaymentIntent`) carry an integer `version`. Any **individual**
+read of one returns it two ways, and every `PATCH`/`PUT` on one must send it
+back:
+
+```http
+GET /doctors/me            →  200,  ETag: "4",  body.version = 4
+PATCH /doctors/me          →  If-Match: "4"
+```
+
+| Situation | Response |
+|---|---|
+| `If-Match` absent | `428 { message, code: 'IF_MATCH_REQUIRED' }` — nothing is written |
+| `If-Match` is a weak validator (`W/"4"`), a list (`"4", "5"`), unquoted, or otherwise not a strong `"<int>"` | `400 { code: 'INVALID_IF_MATCH' }` |
+| `If-Match` doesn't match the stored version | `412 { message, code: 'VERSION_CONFLICT' }` — nothing is written |
+| Match | `200`, body carries the new `version`, and `ETag` is the new one |
+
+Why it exists: without it, two actors who read the same record both write and
+the second silently destroys the first — last write wins, and the loser is
+never told. With it, the compare and the write are a single conditional
+`UPDATE`, so exactly one write can win. Proven against a real database in
+`backend/tests/integration/optimistic-concurrency.test.mts`, including eight
+simultaneous writes on one version.
+
+**Client requirements (docforum-web):** read the resource, keep the `ETag`, send
+it on every `PATCH`/`PUT`, and on `412` re-read and reapply the change (don't
+blind-retry with the old tag). On `428` the client is simply too old to have
+learned this — surface it as an error, not a silent retry.
+
+**Not applied to** endpoints that are already conditionally guarded — booking
+(`POST /appointments`), payment `fund`/`release`/`refund`, doctor verification.
+Their existing status guard is the guard; adding `If-Match` on top would give
+one write two unrelated failure modes. They still return the updated `ETag`.
+
+**Client requirements (docforum-web)** for the affected routes only:
+`fetch(url, { method: 'PATCH', headers: { 'If-Match': etag } })`.
+
+Collection reads (`GET /appointments/mine`, `/admin/audit-events`, …) do not
+carry a record-level `ETag`: fetch the individual resource before editing.
+Append-only records (`Prescription`, `LabOrder`) have no version — a
+correction is a new row, so there is nothing to lose.
 
 ## Availability (`/availability`) — `backend/src/modules/availability`
 

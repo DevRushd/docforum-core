@@ -118,6 +118,7 @@ for status and issue links.
 - [ ] JWT refresh revocation list (ARCHITECTURE.md §6.1.4). Tracked as [issue #18](https://github.com/DocForum/docforum-core/issues/18) (Medium, 150 pts) — unblocked now, operates on Phase 1's auth module.
 - [ ] Held-slot TTL/release job (ARCHITECTURE.md §6.2.1). Tracked as [issue #19](https://github.com/DocForum/docforum-core/issues/19) (Medium, 150 pts) — unblocked now, operates on Phase 1's `AvailabilitySlot`.
 - [x] Access-control test suite: who may read intake, consultation and payment data. Integration tests (`tests/integration/access-control.test.mts`) establishing the test harness and access-control patterns for the three PHI data categories; intake/consultation test cases are scaffolded as placeholders until Phase 2/3 routes exist, payment-intent access cases exercise the live admin-gated routes. Tracked as [issue #44](https://github.com/DocForum/docforum-core/issues/44) — **Done**.
+- [ ] Optimistic concurrency (`version` + `If-Match`) for mutable records. A `version` int on `User`, `PatientProfile`, `DoctorProfile`, `FacilityProfile`, `FacilityCapability`, `Appointment` and `PaymentIntent`; individual reads publish it as a strong `ETag`; `PATCH`/`PUT` require that exact `If-Match` (`428` missing, `400` weak/list/garbage, `412` stale); writes are a single conditional `UPDATE ... WHERE id = ? AND version = ?` that increments, never read-compare-write. Transitions that are already conditional (booking, payment status, verification) keep their own guard and are **not** given a second one. Append-only `Prescription`/`LabOrder` excluded. Convention in ARCHITECTURE.md §5.4. Tracked as [issue #49](https://github.com/DocForum/docforum-core/issues/49) (High, 200 pts) — **in review**, branch `feat/optimistic-concurrency-version-if-match-for`. Foundation only: the one existing editable resource (`DoctorProfile`, via `PATCH /doctors/me`) is wired end-to-end as the reference implementation; every new mutable-resource route in Phases 2–5 must adopt the convention.
 - [ ] Privacy access-control audit: confirm intake/consultation notes are visible only per PRD §7 (patient, treating doctor(s) in-thread, fulfilling facility for that specific order only) — write tests, not just code review. Still blocked — meaningfully auditable only once Phase 3/4/5 access paths exist. Not yet scoped into an issue.
 - [ ] Decide and document what's explicitly out of scope for v1 launch vs. genuinely blocking (e.g., drug-interaction checking, PRD §8.2.8 — needs an explicit go/no-go, not silence). Tracked as [issue #20](https://github.com/DocForum/docforum-core/issues/20) (Trivial, 100 pts) — a decision task, unblocked now.
 
@@ -405,3 +406,23 @@ for status and issue links.
   observed state, so a racing second action gets 409 instead of silently
   overwriting). Rollback coupling proven with a real injected DB failure,
   not a mock. Phase 3/4 wiring explicitly left pending.
+- 2026-10-19 — Issue #49 (optimistic concurrency) opened as a PR: a `version`
+  int on the seven mutable models (`User`, `PatientProfile`, `DoctorProfile`,
+  `FacilityProfile`, `FacilityCapability`, `Appointment`, `PaymentIntent`),
+  individual-resource reads publishing it as a strong `ETag`, and `PATCH`/
+  `PUT` requiring that exact `If-Match` — `428` missing, `400` for a weak
+  validator or a list, `412` stale. The write is one conditional
+  `UPDATE ... WHERE id = ? AND version = ?` with the increment in the same
+  statement (Prisma `updateManyAndReturn`, so the response body is the row
+  that statement wrote), which is what makes eight simultaneous edits on one
+  version resolve to exactly one winner in the integration test. Transitions
+  that are already conditional — booking's slot claim, payment
+  fund/release/refund, doctor verification — deliberately keep only their own
+  status guard instead of gaining a second, unrelated one; they do bump and
+  republish the version. Append-only `Prescription`/`LabOrder` are excluded by
+  design, and the test asserts the exact set of tables carrying a `version` so
+  it can't quietly widen. `PATCH /doctors/me` is the reference implementation
+  of the convention (ARCHITECTURE.md §5.4) — there was no existing
+  patient-profile or appointment edit route to convert, so later phases'
+  mutable routes adopt the convention as they're built rather than being
+  retrofitted here.

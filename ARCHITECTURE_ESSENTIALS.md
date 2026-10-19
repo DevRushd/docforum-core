@@ -18,6 +18,7 @@ Quick-reference only. Full reasoning lives in `ARCHITECTURE.md`. Full product sc
 4. **Cross-module access only through a module's service interface.** Never import another module's `repositories/*` directly.
 5. **Facilities write to their own `FulfillmentRecord` only** — never directly to `Prescription.status` / `LabOrder.status`.
 6. Every module = `routes/ controllers/ services/ repositories/`. Keep that shape.
+7. **Mutable-record edits use optimistic concurrency (Phase 8, issue #49).** Individual-resource read returns a strong version `ETag` (`"4"`); PATCH/PUT must send it in `If-Match` — missing is `428`, weak/list/garbage is `400`, stale is `412`. Write it as ONE conditional `UPDATE ... WHERE id = ? AND version = ?` that increments `version` (Prisma: `updateManyAndReturn`); read-compare-write is forbidden. Status transitions that are *already* conditional (booking, payment status, verification) keep their own guard, don't get a second `If-Match` one, but still bump + republish the version. Append-only `Prescription`/`LabOrder` are excluded. See ARCHITECTURE.md §5.4.
 
 ## Data model map (see ARCHITECTURE.md §4 for full field lists)
 `User` → `PatientProfile | DoctorProfile | FacilityProfile`
@@ -30,6 +31,8 @@ Quick-reference only. Full reasoning lives in `ARCHITECTURE.md`. Full product sc
 `LoginAttempt` (Phase 8, issue #35 — Postgres-backed login throttle buckets, one per normalised email and per client IP; counters move only via a conditional upsert).
 `PatientProfile` → `PatientExport` → `PatientExportChunk` (Phase 8, issue #40 — right-of-access export jobs + their chunked JSON bundle; each module contributes a section via its own service, registered in `src/export-sections.ts` — see ARCHITECTURE.md §3.1).
 `FacilityProfile` → `WalletLink` (payout address) ; `PatientProfile`/`FacilityProfile` → `PaymentIntent` (opaque `orderType`/`orderId` — see docs/adr/0004)
+
+Mutable records above (plus `Appointment` and `PaymentIntent`) carry a `version` int for the `ETag`/`If-Match` convention — hard rule 7, ARCHITECTURE.md §5.4. Mutable profile fields a new route exposes need a conditional write, not just a `.update()`.
 
 ## Payments (Phase 5.5 — see docs/adr/0004-custodial-payments-v1.md)
 - **Custodial v1**: `docforum-core` holds its own Stellar payer + releaser identities (`PLATFORM_PAYER_SECRET`/`PLATFORM_RELEASER_SECRET` env vars). Patients never hold or sign with a wallet — the only reason this is possible without violating `docforum-web`'s "no direct Stellar calls" hard rule.
