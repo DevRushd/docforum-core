@@ -148,8 +148,101 @@ drift apart. See `docs/adr/0003` for why production needs `SameSite=None`.
 
 | Method & path | Auth | Body | Notes |
 |---|---|---|---|
-| `POST /appointments` | patient | `{ availabilitySlotId }` | **The concurrency-critical endpoint** — see `ARCHITECTURE.md` §5.1 and `backend/tests/integration/booking.test.mts`. `409` if the slot is no longer open. |
+| `POST /appointments` | patient | `{ availabilitySlotId }` | **The concurrency-critical endpoint** — see `ARCHITECTURE.md` §5.1 and `backend/tests/integration/booking.test.mts`. `409` if the slot is no longer open. Honours `Idempotency-Key` (below). |
 | `GET /appointments/mine` | patient | — | Caller's own appointments, most recent first. |
+
+## Idempotency-Key (`POST` mutations) — `backend/src/middleware/idempotency.ts`
+
+Phase 8, issue #48. A patient on a mobile connection loses signal mid-request,
+sees a timeout and taps retry. Without this, the backend cannot tell that retry
+from a deliberate second attempt, and the same tap books twice or funds twice —
+and no amount of "check then write" fixes it, because two retries 20 ms apart
+both pass the check. This is the same problem §5.1 solves for slots, one layer
+up.
+
+**Send `Idempotency-Key: <unique value>` on these routes:**
+
+| Route |
+|---|
+| `POST /appointments` |
+| `POST /payments/intents` |
+| `POST /payments/intents/:id/fund` |
+| `POST /payments/intents/:id/release` |
+| `POST /payments/intents/:id/refund` |
+
+The header is **optional** — a request without one behaves exactly as before,
+so nothing breaks if a client doesn't send it. But any client that retries
+should send one, and should generate a fresh value per *logical* operation
+(a UUID, or `crypto.randomUUID()`), not per HTTP attempt.
+
+What the header buys you:
+
+| Situation | Response |
+|---|---|
+| Same key, **same** request, first attempt | The normal response (`201`/`200`), stored for 24 h |
+| Same key, **same** request, retried within 24 h | The **stored** status and body, byte-for-byte, plus `Idempotency-Replayed: true`. The handler does not run again — no second booking, no second Stellar transaction |
+| Same key, **different** body / route / target `:id` | `422` `{ message, code: 'IDEMPOTENCY_KEY_REUSED' }`. Nothing is executed |
+| Same key, while the first request is **still running** | `409` `{ message, code: 'IN_PROGRESS' }` + `Retry-After: 1`. Retry shortly with the *same* key — it will then replay |
+| Same key after the stored response is older than 24 h | Treated as a new request and executed |
+| Malformed key (empty, whitespace, non-ASCII, > 255 chars) | `400` `{ message, code: 'INVALID_IDEMPOTENCY_KEY' }`. Nothing is executed |
+| The attempt fails with **5xx** | Nothing is cached and no row is kept — **retry with the same key and the request runs again.** A server error is not a result; caching one would turn a transient failure into a permanent answer for that key |
+
+`4xx` responses *are* cached: the request ran, and its answer is the answer, so
+a retry gets the same `409` rather than a different outcome.
+
+**Client requirements (docforum-web):**
+
+- Generate the key when the user *initiates* the action (not inside the retry
+  loop) and reuse it for every retry of that action.
+- Treat `409 IN_PROGRESS` as "retry in `Retry-After` seconds", not as a
+  failure — a concurrent duplicate of the same tap lands here.
+- Treat `422 IDEMPOTENCY_KEY_REUSED` as a client bug: two different operations
+  were sent under one key. Generate a new key for the second one.
+- A replayed response is identical to the original, so a client must not
+  expect a fresh object id.
+
+**Why it isn't an in-memory lock:** ownership is decided by a unique constraint
+on `(userId, key)` in Postgres (`IdempotencyKey`, `ARCHITECTURE.md` §4.12).
+Whichever request wins the INSERT runs the handler; every other one reads the
+row. A `Map` of pending keys would be correct on one instance and silently
+wrong on two — and would be emptied by exactly the restart that a retry storm
+follows. Keys are namespaced **per user**: one account can never replay, read
+or shadow another account's stored response, because every lookup is filtered
+by user id. An `Idempotency-Key` is a guessable string and is not a credential.
+
+Env knobs: `IDEMPOTENCY_RECORD_TTL_HOURS` (default 24),
+`IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS` (default 300 — how long an attempt
+abandoned by a crashed process stays stuck before an identical retry may take
+it over), `IDEMPOTENCY_MAX_CACHED_BODY_BYTES` (default 256 KiB; a larger
+response is executed but not cached, so a retry re-runs it),
+`IDEMPOTENCY_PRUNE_INTERVAL_SECONDS` (cleanup interval in `src/server.ts`).
+
+Stored responses are not patient data today and are not part of the
+patient-export bundle; see `ARCHITECTURE.md` §6.2.6 for the condition that
+would change that.
+
+## Payments (`/payments`) — `backend/src/modules/payments`
+
+Custodial v1 (`docs/adr/0004-custodial-payments-v1.md`): this repo holds the
+platform payer/releaser identities and calls `docforum-escrow`'s SDK. Every
+intent route requires a verified address, and the intent routes are
+admin-triggered in v1 because Phase 4/5 order issuance doesn't exist yet to
+trigger them.
+
+| Method & path | Auth | Body | Notes |
+|---|---|---|---|
+| `POST /payments/wallet-link` | facility | `{ stellarPublicKey }` | Links the **facility's** payout wallet (the on-chain payee — never the patient's). |
+| `GET /payments/wallet-link` | facility | — | The caller's own link, or `404`. |
+| `POST /payments/intents` | admin | `{ orderType, orderId, patientProfileId, facilityId, amountStroops }` | `amountStroops` is a positive integer **string** (a JSON number can't carry bigint precision). `orderType`/`orderId` are opaque — `Prescription`/`LabOrder` don't exist yet (Phase 4). Honours `Idempotency-Key`. |
+| `GET /payments/intents/:id` | admin | — | Single intent; `404` if unknown. |
+| `POST /payments/intents/:id/fund` | admin | — | `created` → `escrowed`, moves funds from the platform payer. `409` if the intent isn't `created`, or its facility has no linked wallet. Honours `Idempotency-Key`. |
+| `POST /payments/intents/:id/release` | admin | — | `escrowed` → `released`, pays the facility. Honours `Idempotency-Key`. |
+| `POST /payments/intents/:id/refund` | admin | — | `escrowed` → `refunded`. Honours `Idempotency-Key`. |
+
+A retried fund/release/refund replays its first response instead of pushing a
+second Stellar transaction. That is the belt to §4.10's braces, not a
+replacement for them: two *different* keys racing the same transition still
+resolve through the conditional status write, and the loser gets `409`.
 
 ## Audit trail (`/admin/audit-events`) — `backend/src/modules/audit`
 
@@ -242,5 +335,7 @@ the cleanup job deletes the stored bundle. Other knobs: `PATIENT_EXPORT_PAGE_SIZ
 
 Everything else in `ARCHITECTURE.md` §3's module list (`facilities`,
 `consultations`, `referrals`, `prescriptions`, `lab-orders`,
-`pharmacy-orders`, `payments`, `notifications`) has no routes yet — Phase
-2 onward, see `ROADMAP.md`.
+`pharmacy-orders`, `notifications`) has no routes yet — Phase
+2 onward, see `ROADMAP.md`. (`payments` *does* have routes — see its section
+above; Phase 5.5 shipped it ahead of the order modules it will eventually be
+triggered by.)

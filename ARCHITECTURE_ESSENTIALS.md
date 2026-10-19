@@ -29,6 +29,7 @@ Quick-reference only. Full reasoning lives in `ARCHITECTURE.md`. Full product sc
 `User` → `EmailVerificationToken` (Phase 8, issue #34 — hashed/expiring, single-use; `User.emailVerifiedAt` gates booking + payment mutations, never login/browsing).
 `LoginAttempt` (Phase 8, issue #35 — Postgres-backed login throttle buckets, one per normalised email and per client IP; counters move only via a conditional upsert).
 `PatientProfile` → `PatientExport` → `PatientExportChunk` (Phase 8, issue #40 — right-of-access export jobs + their chunked JSON bundle; each module contributes a section via its own service, registered in `src/export-sections.ts` — see ARCHITECTURE.md §3.1).
+`User` → `IdempotencyKey` (Phase 8, issue #48 — `Idempotency-Key` replay protection for booking + payment mutations; the unique `(userId, key)` index *is* the lock, so there is no in-memory lock; middleware in `src/middleware/idempotency.ts`, per-route opt-in, see §4.12).
 `FacilityProfile` → `WalletLink` (payout address) ; `PatientProfile`/`FacilityProfile` → `PaymentIntent` (opaque `orderType`/`orderId` — see docs/adr/0004)
 
 ## Payments (Phase 5.5 — see docs/adr/0004-custodial-payments-v1.md)
@@ -42,6 +43,7 @@ Quick-reference only. Full reasoning lives in `ARCHITECTURE.md`. Full product sc
 - No routing rule yet for a referral with no specific target doctor (which specialist gets it?).
 - No expiry/TTL job for held slots or pending referrals — currently just an enum value with no worker.
 - Polymorphic `FulfillmentRecord.order_id` is a sketch, not final — may need splitting into two tables.
+- `IdempotencyKey.response_body` (Phase 8, issue #48 — ARCHITECTURE.md §4.12) is a temporary copy of a response, kept 24 h. Non-PHI today; **a route that returns clinical free text must not opt in** until the export registry (ARCHITECTURE.md §3.1) can account for it.
 - `AuditEvent` foundation exists (Phase 8, issue #43 — ARCHITECTURE.md §4.10): append-only (DB triggers), written by `auditService.record(tx, …)` **inside the same transaction** as the change. Wired for booking, doctor verification and payment fund/release/refund only — **Phase 3/4 transitions must call it when they're built.** Never put PHI in `metadata`.
 - No email/SMS provider integrated yet (Phase 6, issue #17) — email verification (issue #34) therefore can't deliver its link on a hosted deployment; `backend/scripts/mark-email-verified.mjs` is the interim operator path.
 - One doctor = one calendar assumed; multi-facility doctors not modeled.

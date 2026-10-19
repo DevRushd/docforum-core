@@ -292,6 +292,46 @@ Bundle format (schemaVersion 1): `{ format: "docforum.patient-export",
 schemaVersion, exportId, generatedAt, sections: { <name>: { version, items } } }`
 — see §3.1 for where sections come from.
 
+### 4.12 Idempotency keys (Phase 8, issue #48)
+```
+IdempotencyKey
+  id, user_id, key, method, route, request_hash
+  response_status (nullable int), response_body (jsonb, nullable),
+    response_headers (jsonb, nullable — `Location` only, never Set-Cookie)
+  created_at, expires_at
+  # unique (user_id, key) — this constraint IS the concurrency mechanism, the
+    same way §5.1's conditional slot claim is. Whichever request wins the
+    INSERT owns the attempt; every other one reads the row and either replays
+    the stored response, is told one is in flight, or is refused for reusing
+    the key on a different request. There is no in-memory lock anywhere, so
+    this behaves identically on one instance and on ten.
+  # Scoped per user on purpose: an Idempotency-Key is a guessable string, so
+    it must never be usable as a bearer credential for another account's
+    stored body. Every read filters on user_id.
+  # route is the route *pattern* ('/payments/intents/:id/fund'), request_hash
+    is SHA-256 over method + concrete path + canonical JSON body. The concrete
+    path is in the hash so one key aimed at two different :ids is a mismatch,
+    not a replay of the first record's response.
+  # response_* are NULL while the attempt is in flight. That gap is what a
+    concurrent duplicate sees, and what it waits on.
+  # NOT an AuditEvent: a 5xx deletes the row outright (a server error is not
+    a result — the client retries with the same key and it runs again), and an
+    attempt abandoned by a crashed process is taken over once it is older than
+    IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS. A takeover is only ever by an
+    identical request, so a stale row can't be re-pointed at a new operation.
+  # Retained for IDEMPOTENCY_RECORD_TTL_HOURS (default 24) and pruned by an
+    interval in src/server.ts. Reads filter on expires_at first, so a missed
+    prune costs storage, not correctness.
+  # Holds a copy of a response the requesting user already received. Not
+    patient data today, and deliberately not exported or listed — see §6.2.6
+    for the condition that would change that.
+```
+Opted into by middleware (`src/middleware/idempotency.ts`), per route, not
+globally: `POST /appointments`, `POST /payments/intents`, and
+`POST /payments/intents/:id/{fund,release,refund}`. The header is optional
+(a request without one passes through untouched, so existing clients keep
+working), but a client that retries should always send one.
+
 ## 5. Key flows (sequence-level, not code)
 
 ### 5.1 Booking (concurrency-safe)
@@ -327,6 +367,7 @@ schemaVersion, exportId, generatedAt, sections: { <name>: { version, items } } }
 3. No schema support yet for a doctor working across multiple facilities/locations (PRD edge case 6) — `AvailabilitySlot` currently assumes one calendar per doctor.
 4. No audit-log table — every FR around auditability (PRD §7) currently relies on `created_at/updated_at` timestamps only, which is not sufficient for "who changed what." A dedicated `AuditEvent` table is likely needed before this ships to real patients. **Foundation resolved 2026-10-17 (issue #43):** `AuditEvent` (§4.10) + `audit.record()` in the same transaction as the change, append-only at the DB level, wired into booking, doctor verification and payment fund/release/refund. **Still open:** Phase 3/4 transitions (referrals, prescriptions, lab orders, fulfillment) must be wired as they're built; the admin login-throttle clear (`/auth/login-attempts/clear`) still only logs to the console; the app connects as the database owner, which could disable the triggers — enforcing append-only against the owner needs a separate least-privilege DB role (deployment work, issue #22).
 5. CSRF on the cookie-authenticated routes — the refresh cookie has to be `SameSite=None; Secure` (the Pages frontend is a different site — see `docs/adr/0003`), which means any site the patient visits can make their browser send it to `/auth/refresh` and `/auth/logout`. **Resolved 2026-10-15 (issue #37):** a per-session CSRF token is bound into the refresh token and required in the `X-CSRF-Token` header, the `Origin` header is validated against an explicit allowlist, and CORS is now a per-environment allowlist (`CORS_ORIGINS`) instead of one configured string. The double-submit cookie pattern — the usual answer — is *not* usable here: a cookie set by this API is a third-party cookie to `docforum.github.io`, so the frontend's JavaScript can never read it; the token travels in the login/refresh response body instead. A request with no `Origin` (curl, server-to-server) is allowed through the Origin check but still needs the token. See `backend/src/middleware/csrf.ts`, and `docs/api/README.md` for what the client must send. Consequence: refresh cookies issued before this change carry no `csrf` claim and are rejected, i.e. existing sessions need one re-login.
+6. **Added 2026-10-19 (issue #48):** an `IdempotencyKey` row caches a *copy of a response body* for 24 hours (§4.12). Today every opted-in route returns non-PHI data (an appointment id and status, a payment intent), so this is transport bookkeeping and not a patient-data surface — it is not part of the patient-export bundle (§3.1) and no endpoint lists it. **The condition that would change that:** if a route returning clinical free text (consultation notes, intake payloads, lab results) ever opts in, each row becomes a temporary PHI copy subject to right-of-access and retention, and the export registry in §3.1 has to gain a section for it before that route is allowed to opt in. Until then, adding a route to the opted-in list is a deliberate decision, not a default.
 
 ### 6.3 What's overengineered (architecture-level, for v1)?
 1. Polymorphic fulfillment design (§4.7) may itself be premature abstraction — two small, boring, separate tables might beat one clever polymorphic one at this stage. Flagged as a design smell to revisit, not shipped as-is.
@@ -338,6 +379,7 @@ schemaVersion, exportId, generatedAt, sections: { <name>: { version, items } } }
 
 - **Testing**: unit tests per module (`backend/tests/unit`), integration tests for booking/referral/order flows specifically because those are the correctness-critical paths (`backend/tests/integration`).
 - **Security — login throttling (Phase 8, issue #35)**: `POST /auth/login` is throttled per normalised email *and* per client IP, in Postgres (`LoginAttempt`, §4.9): exponential backoff with `Retry-After` from `LOGIN_THROTTLE_BACKOFF_AFTER` failures, a temporary lock at `LOGIN_THROTTLE_LOCK_AFTER`, and a cleanup interval in `src/server.ts`. Two things this depends on operationally: (1) `TRUST_PROXY` must be set correctly in production — Render terminates TLS in front of exactly one hop, so `TRUST_PROXY=1`; leaving it unset makes every request look like Render's proxy (one shared bucket for everyone), and `true` lets a client spoof `X-Forwarded-For` for a fresh bucket per request; (2) the throttle deliberately does not reveal whether an account exists — locked, backoff and unknown-account responses are identical, and an absent account still pays the bcrypt comparison cost so response timing doesn't leak either.
+- **Idempotent retries (Phase 8, issue #48)**: `POST /appointments`, `POST /payments/intents` and `POST /payments/intents/:id/{fund,release,refund}` honour an `Idempotency-Key` header (`src/middleware/idempotency.ts`). A repeat of the same key with the same request body inside 24 h replays the stored status and body instead of running the mutation again; the same key with a different body is `422`; a second request arriving while the first is still running is `409 IN_PROGRESS` with a `Retry-After`, because ownership is decided by the unique constraint on `(userId, key)` rather than by an in-memory lock that would be correct on one instance and broken on two. Keys are namespaced per user, and 5xx is never cached so a client can retry a failed call with the same key. See §4.12 for the model.
 - **Migrations**: Prisma migrations are the only way schema changes happen — no manual DB edits, ever.
 - **Environments**: local (Docker Compose), staging, production — staging/production infra choice is an open item (see ROADMAP).
 
