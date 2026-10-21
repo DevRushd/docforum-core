@@ -1,4 +1,10 @@
 import 'dotenv/config';
+import { parsePaymentsConfig } from './payments';
+
+const payoutPrivacyMode = process.env.PAYOUT_PRIVACY_MODE ?? 'facility';
+if (payoutPrivacyMode !== 'facility' && payoutPrivacyMode !== 'pooled') {
+  throw new Error('PAYOUT_PRIVACY_MODE must be either "facility" or "pooled".');
+}
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -41,6 +47,21 @@ export const config = {
     // until that's built (Phase 8).
     accessTtl: '15m',
     refreshTtl: '30d',
+  },
+  // Base URL of docforum-web, used to build the link in outbound
+  // notifications (password reset today). Not a provider decision — see
+  // issue #17 — just the URL the recipient is sent to.
+  appBaseUrl: process.env.APP_BASE_URL ?? 'http://localhost:5173',
+  passwordReset: {
+    // Raw tokens are single-use and short-lived; only their SHA-256 hash
+    // is stored (see PasswordResetToken in schema.prisma).
+    tokenTtlMinutes: Number(process.env.PASSWORD_RESET_TOKEN_TTL_MINUTES ?? 30),
+    // Rate limits on POST /auth/password-reset/request, so the endpoint
+    // can't be used to spam an inbox. Applied per email AND per IP —
+    // either limit being hit returns 429. See auth/services/rate-limit.ts
+    // for the (in-memory, single-process) caveat.
+    requestsPerEmailPerHour: Number(process.env.PASSWORD_RESET_REQUESTS_PER_EMAIL_PER_HOUR ?? 3),
+    requestsPerIpPerHour: Number(process.env.PASSWORD_RESET_REQUESTS_PER_IP_PER_HOUR ?? 10),
   },
   // Phase 8 hardening knobs (issues #34/#35/#37). Env-configurable so a
   // preview deployment can be tightened without a code change, and so
@@ -86,30 +107,12 @@ export const config = {
     pruneIntervalSeconds: Number(process.env.LOGIN_THROTTLE_PRUNE_INTERVAL_SECONDS ?? 60 * 60),
     pruneAfterSeconds: Number(process.env.LOGIN_THROTTLE_PRUNE_AFTER_SECONDS ?? 24 * 60 * 60),
   },
-  // `Idempotency-Key` replay protection (Phase 8, issue #48). Env-configurable
-  // for the same reason as the knobs above: retention and the crash-recovery
-  // window are deployment decisions, and tests need them short.
-  idempotency: {
-    // How long a completed response stays replayable. The issue fixes this at
-    // 24h: long enough to cover a client that was offline for a day, short
-    // enough that the table doesn't accumulate a copy of every mutation's
-    // response body forever.
-    recordTtlHours: Number(process.env.IDEMPOTENCY_RECORD_TTL_HOURS ?? 24),
-    // How long an attempt may sit unfinished before another request with the
-    // same key and the same body may take it over. This exists only to recover
-    // from a process that died mid-request and left a row with no response —
-    // it is NOT a "wait this long then assume it worked" timer, because that
-    // would be a duplicate-write bug. Set it well above the slowest real
-    // request (an escrow call over the network), never below it.
-    inProgressTimeoutSeconds: Number(process.env.IDEMPOTENCY_IN_PROGRESS_TIMEOUT_SECONDS ?? 300),
-    // Responses larger than this are executed but not cached: the row is
-    // dropped instead, so a retry re-runs the request rather than replaying a
-    // truncated body. Keeps one row from becoming an unbounded blob.
-    maxCachedBodyBytes: Number(process.env.IDEMPOTENCY_MAX_CACHED_BODY_BYTES ?? 256 * 1024),
-    // Cleanup job (src/server.ts): how often to drop rows whose TTL has
-    // passed. Reads always filter on `expiresAt` first, so a missed run is a
-    // storage cost, not a correctness problem.
-    pruneIntervalSeconds: Number(process.env.IDEMPOTENCY_PRUNE_INTERVAL_SECONDS ?? 60 * 60),
+  // PHI read-access log (Phase 8, issue #45). How long AccessLog rows are
+  // kept before the prune job (src/server.ts) deletes them. Reads are far
+  // higher volume than AuditEvent writes, so this gets its own, shorter
+  // retention instead of AuditEvent's append-forever lifetime.
+  accessLog: {
+    retentionDays: Number(process.env.ACCESS_LOG_RETENTION_DAYS ?? 365),
   },
   // Patient data export (Phase 8, issue #40). Env-configurable so a
   // deployment can tune retention and memory bounds without a code change.
@@ -154,16 +157,15 @@ export const config = {
     sameSite: process.env.NODE_ENV === 'production' ? ('none' as const) : ('lax' as const),
     path: '/',
   },
-  // Deliberately NOT required at startup via requireEnv() — unrelated
-  // parts of the app (auth, availability, etc.) shouldn't fail to boot
-  // just because payments isn't configured. The payments module itself
-  // (services/index.ts) validates these are present before doing
-  // anything that needs them, with a clear error naming which is
-  // missing. See docs/adr/0004-custodial-payments-v1.md.
+  // Admin invites (Phase 8, issue #39). `acceptUrl` is where the invite link
+  // points — docforum-web owns the page that consumes `?token=`.
+  adminInvites: {
+    ttlHours: Number(process.env.ADMIN_INVITE_TTL_HOURS ?? 72),
+    acceptUrl: process.env.ADMIN_INVITE_ACCEPT_URL ?? 'http://localhost:5173/accept-admin-invite',
+  },
   payments: {
-    platformPayerSecret: process.env.PLATFORM_PAYER_SECRET,
-    platformReleaserSecret: process.env.PLATFORM_RELEASER_SECRET,
-    escrowContractId: process.env.ESCROW_CONTRACT_ID,
-    escrowTokenId: process.env.ESCROW_TOKEN_ID,
+    ...parsePaymentsConfig(process.env),
+    payoutPrivacyMode,
+    payoutPrivacyPoolAddress: process.env.PAYOUT_PRIVACY_POOL_ADDRESS,
   },
 } as const;
