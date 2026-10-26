@@ -22,7 +22,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import EmbeddedPostgres from 'embedded-postgres';
 
 const BACKEND_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const PORT = 5448; // unique per integration file
+const PORT = 5459; // unique per integration file
 const runId = Date.now();
 const MINUTE = 60_000;
 
@@ -87,6 +87,12 @@ describe('facility price lists and intent pricing (issue #127)', () => {
       data: { userId: ownerUser.id, name: 'Aaa Prices Lab', type: 'lab' },
     });
     facilityId = facility.id;
+    // Issue #14 made a matching FacilityCapability row a condition of being
+    // eligible at all (fail closed) — this file is about pricing, so the
+    // qualification data is seeded directly rather than re-tested here.
+    await prisma.facilityCapability.create({
+      data: { facilityProfileId: facilityId, capabilityType: 'lab_test', detail: null },
+    });
 
     const strangerUser = await prisma.user.create({
       data: { email: `prices-stranger-${runId}@example.com`, passwordHash: 'unused', role: 'facility' },
@@ -110,8 +116,9 @@ describe('facility price lists and intent pricing (issue #127)', () => {
     const slot = await prisma.availabilitySlot.create({
       data: { doctorProfileId, startTime, endTime: new Date(startTime.getTime() + 30 * MINUTE) },
     });
+    // Orders hang off a consultation whose visit happened (issue #10).
     const appointment = await prisma.appointment.create({
-      data: { patientProfileId, doctorProfileId, availabilitySlotId: slot.id },
+      data: { patientProfileId, doctorProfileId, availabilitySlotId: slot.id, status: 'completed' },
     });
     const consultation = await prisma.consultation.create({ data: { appointmentId: appointment.id } });
     consultationId = consultation.id;
@@ -211,14 +218,14 @@ describe('facility price lists and intent pricing (issue #127)', () => {
 
     expect(order.amountStroops).toBe(30_000_000n);
     const intent = await prisma.paymentIntent.findUniqueOrThrow({ where: { id: order.paymentIntent.id } });
-    expect(intent.amountStroops).toBe(30_000_000n);
+    expect(intent.amount).toBe(30_000_000n);
     expect(intent.catalogItemCode).toBe('cbc-panel');
     expect(intent.facilityId).toBe(facilityId);
 
     // A later price change must not re-price an existing intent.
     await publish({ catalogItemCode: 'cbc-panel', amount: '99000000' });
     const afterChange = await prisma.paymentIntent.findUniqueOrThrow({ where: { id: intent.id } });
-    expect(afterChange.amountStroops).toBe(30_000_000n);
+    expect(afterChange.amount).toBe(30_000_000n);
     expect(afterChange.catalogItemCode).toBe('cbc-panel');
   });
 
@@ -246,7 +253,7 @@ describe('facility price lists and intent pricing (issue #127)', () => {
     });
     expect(order.amountStroops).toBe(4_200_000n);
     const intent = await prisma.paymentIntent.findUniqueOrThrow({ where: { id: order.paymentIntent.id } });
-    expect(intent.amountStroops).toBe(4_200_000n);
+    expect(intent.amount).toBe(4_200_000n);
     expect(intent.catalogItemCode).toBeNull();
   });
 });
