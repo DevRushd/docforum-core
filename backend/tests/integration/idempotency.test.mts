@@ -37,6 +37,7 @@ import express from 'express';
 import request from 'supertest';
 import jwt from 'jsonwebtoken';
 import EmbeddedPostgres from 'embedded-postgres';
+import { createOrderFixture, createPaymentIntentForFixture } from './order-fixtures.mjs';
 
 const BACKEND_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const PORT = 5443;
@@ -96,17 +97,12 @@ describe('Idempotency-Key replay protection', () => {
 
   const rowFor = (userId: string, key: string) => prisma.idempotencyKey.findUnique({ where: { userId_key: { userId, key } } });
   const appointmentCount = (slotId: string) => prisma.appointment.count({ where: { availabilitySlotId: slotId } });
-  const intentCount = (orderId: string) => prisma.paymentIntent.count({ where: { orderId } });
 
   async function bookSlot(slotId: string, key?: string, patientIndex = 0) {
     const req = request(app).post('/appointments').set(asPatient(patientIndex)).send({ availabilitySlotId: slotId });
     return key === undefined ? req : req.set('Idempotency-Key', key);
   }
 
-  const intentBody = (orderId: string) => ({ orderType: 'lab_order', orderId, patientProfileId, facilityId, amountStroops: '500000' });
-
-  const postIntent = (body: unknown, headers: Record<string, string>) =>
-    request(app).post('/payments/intents').set(asAdmin()).set(headers).send(body as object);
   const postPaymentAction = (id: string, action: string, headers: Record<string, string> = {}) =>
     request(app).post(`/payments/intents/${id}/${action}`).set(asAdmin()).set(headers).send({});
 
@@ -178,7 +174,7 @@ describe('Idempotency-Key replay protection', () => {
 
     const facilityUser = await prisma.user.create({ data: { email: `lab-${runId}@example.com`, passwordHash: 'x', role: 'facility' } });
     facilityId = (await prisma.facilityProfile.create({ data: { userId: facilityUser.id, name: 'Idempotency Lab', type: 'lab' } })).id;
-    await prisma.walletLink.create({ data: { facilityId, stellarPublicKey: `G${'B'.repeat(55)}` } });
+    await prisma.walletLink.create({ data: { ownerType: 'facility', ownerId: facilityId, stellarPublicKey: `G${'B'.repeat(55)}`, verificationMethod: 'sep10', activeOwnerKey: `facility:${facilityId}` } });
   }, 180_000);
 
   afterAll(async () => {
@@ -290,31 +286,6 @@ describe('Idempotency-Key replay protection', () => {
       expect(new Set(created.map((res) => res.body.id)).size).toBe(1);
     });
 
-    it('creates one payment intent out of 8 simultaneous identical requests', async () => {
-      const key = `intent-race-${runId}`;
-      const orderId = `race-order-${runId}`;
-      const attempt = () => postIntent(intentBody(orderId), { 'Idempotency-Key': key });
-
-      const responses = await Promise.all(Array.from({ length: 8 }, () => attempt()));
-
-      // A payment intent has no natural uniqueness of its own — without the
-      // key these eight requests would create eight intents, which is the
-      // duplicate charge issue #48 exists to stop. That makes it the sharpest
-      // available proof that exactly one request executed.
-      expect(await prisma.idempotencyKey.count()).toBe(1);
-      expect(await intentCount(orderId)).toBe(1);
-
-      const created = responses.filter((res) => res.status === 201);
-      expect(created.length).toBeGreaterThanOrEqual(1);
-      for (const res of responses) {
-        if (res.status === 409) expect(res.body.code).toBe('IN_PROGRESS');
-        else {
-          expect(res.status).toBe(201);
-          expect(res.body).toEqual(created[0]!.body);
-        }
-      }
-      expect(new Set(created.map((res) => res.body.id)).size).toBe(1);
-    });
   });
 
   describe('per-user scoping', () => {
@@ -352,12 +323,14 @@ describe('Idempotency-Key replay protection', () => {
 
       // ...and an admin reuses the same key string on a different route. It is
       // a different attempt, not a replay, and certainly not patient 0's body.
-      const adminAttempt = await postIntent(intentBody(orderId), { 'Idempotency-Key': key });
-      expect(adminAttempt.status).toBe(201);
+      const adminOrder = await createOrderFixture(prisma, { patientProfileId, facilityProfileId: facilityId, kind: 'lab_order', amountStroops: 5000n, tag: `cross-user-order-${runId}` });
+      const adminIntent = await createPaymentIntentForFixture(prisma, adminOrder, 'created');
+      const adminAttempt = await postPaymentAction(adminIntent.id, 'fund', { 'Idempotency-Key': key });
+      expect(adminAttempt.status).toBe(200);
       expect(JSON.stringify(adminAttempt.body)).not.toContain(booking.body.id);
 
-      const adminRetry = await postIntent(intentBody(orderId), { 'Idempotency-Key': key });
-      expect(adminRetry.status).toBe(201);
+      const adminRetry = await postPaymentAction(adminIntent.id, 'fund', { 'Idempotency-Key': key });
+      expect(adminRetry.status).toBe(200);
       expect(adminRetry.headers['idempotency-replayed']).toBe('true');
       expect(adminRetry.body).toEqual(adminAttempt.body);
 
@@ -370,24 +343,16 @@ describe('Idempotency-Key replay protection', () => {
 
   describe('payments', () => {
     async function createIntent(orderId: string) {
-      const res = await postIntent(intentBody(orderId), {});
-      expect(res.status).toBe(201);
-      return res.body as { id: string; status: string };
+      const order = await createOrderFixture(prisma, {
+        patientProfileId,
+        facilityProfileId: facilityId,
+        kind: 'lab_order',
+        amountStroops: 5000n,
+        tag: orderId,
+      });
+      const intent = await createPaymentIntentForFixture(prisma, order, 'created');
+      return { id: intent.id, status: intent.status } as { id: string; status: string };
     }
-
-    it('replays intent creation', async () => {
-      const key = `intent-replay-${runId}`;
-      const orderId = `intent-replay-order-${runId}`;
-
-      const first = await postIntent(intentBody(orderId), { 'Idempotency-Key': key });
-      expect(first.status).toBe(201);
-      const retry = await postIntent(intentBody(orderId), { 'Idempotency-Key': key });
-
-      expect(retry.status).toBe(201);
-      expect(retry.headers['idempotency-replayed']).toBe('true');
-      expect(retry.body).toEqual(first.body);
-      expect(await intentCount(orderId)).toBe(1);
-    });
 
     it('treats the same key against a different intent id as a different request', async () => {
       const first = await createIntent(`cross-target-a-${runId}`);

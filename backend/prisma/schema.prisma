@@ -131,6 +131,7 @@ enum Urgency {
 
 model User {
   id                    String    @id @default(uuid())
+  version     Int      @default(1)
   email                 String    @unique
   phone                 String?
   passwordHash          String
@@ -301,6 +302,7 @@ model RefreshSession {
 
 model PatientProfile {
   id           String    @id @default(uuid())
+  version     Int      @default(1)
   // Null for a dependent (Phase 8, issue #42, docs/adr/0011): a
   // guardian-owned profile with no login of its own. Still unique, so a
   // login owns at most one profile. A DB CHECK (see the
@@ -439,6 +441,7 @@ model Guardianship {
 
 model DoctorProfile {
   id                 String             @id @default(uuid())
+  version     Int      @default(1)
   userId             String             @unique
   fullName           String
   verificationStatus VerificationStatus @default(pending)
@@ -484,6 +487,7 @@ model DoctorSpecialty {
 
 model FacilityProfile {
   id        String       @id @default(uuid())
+  version     Int      @default(1)
   userId    String       @unique
   name      String
   type      FacilityType
@@ -510,6 +514,7 @@ model FacilityProfile {
 model FacilityCapability {
   waitlistEntries   WaitlistEntry[]
   id                String          @id @default(uuid())
+  version     Int      @default(1)
   facilityProfileId String
   capabilityType    CapabilityType
   // e.g. a lab test category, or a medication class — free text on purpose,
@@ -573,6 +578,7 @@ model AvailabilitySlot {
 
 model Appointment {
   id                 String            @id @default(uuid())
+  version     Int      @default(1)
   patientProfileId   String
   doctorProfileId    String
   // Nullable because a CANCELLED appointment releases its slot back to
@@ -1039,6 +1045,7 @@ enum PaymentIntentStatus {
 
 model PaymentIntent {
   id             String              @id @default(uuid())
+  version     Int      @default(1)
   prescriptionId String?             @unique
   labOrderId     String?             @unique
   status         PaymentIntentStatus @default(created)
