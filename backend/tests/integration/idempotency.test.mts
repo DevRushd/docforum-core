@@ -315,8 +315,6 @@ describe('Idempotency-Key replay protection', () => {
 
     it('never hands one user a stored response that belongs to another', async () => {
       const key = `cross-user-${runId}`;
-      const orderId = `cross-user-order-${runId}`;
-
       // Patient 0 books under this key...
       const booking = await bookSlot(slots[7]!, key, 0);
       expect(booking.status).toBe(201);
